@@ -1,6 +1,8 @@
 """
 Proxy Server - Steel Challenge Solution
 
+The reason I choose to use duckdb rather than say just a file was because it is already pretty lightweight, can be easily extended and integrated.
+I could have used sqlite but duckdb has more creature comforts and is efficient enough. That does come with some tradeoffs, such as the need to install the duckdb library. whereas sqlite ialready included when users install python.
 An authenticated HTTP/HTTPS proxy server with bandwidth and site analytics.
 
 Usage:
@@ -17,15 +19,41 @@ Default user: testuser / testpass
 """
 
 import asyncio
-import base64
-import json
-import signal
+import hashlib
+import os
 import sys
+from base64 import b64decode
+from functools import partial
+from json import dumps
 from urllib.parse import urlparse
 
-import aiohttp
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 from duckdb import connect
+
+SCRYPT_N = 16384
+SCRYPT_R = 8
+SCRYPT_P = 1
+
+
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    if salt is None:
+        salt = os.urandom(16)
+    dk = hashlib.scrypt(
+        password.encode(), salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32
+    )
+    return salt.hex() + ":" + dk.hex()
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt_hex, dk_hex = stored.split(":", 1)
+        salt = bytes.fromhex(salt_hex)
+        dk = hashlib.scrypt(
+            password.encode(), salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32
+        )
+        return dk.hex() == dk_hex
+    except Exception:
+        return False
 
 
 def format_bytes(n: int) -> str:
@@ -39,7 +67,7 @@ def format_bytes(n: int) -> str:
         return f"{round(n / 1073741824, 2)}GB"
 
 
-def get_metrics(conn) -> dict:
+def _db_get_metrics(conn) -> dict:
     row = conn.execute("SELECT COALESCE(SUM(total_bytes), 0) FROM bandwidth").fetchone()
     total = row[0] if row else 0
     sites = conn.execute(
@@ -51,46 +79,85 @@ def get_metrics(conn) -> dict:
     }
 
 
+def _db_authenticate(conn, username: str, password: str) -> bool:
+    result = conn.execute(
+        "SELECT secret FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    if result is None:
+        return False
+    return verify_password(password, result[0])
+
+
+def _db_track_site(conn, host: str):
+    conn.execute(
+        "INSERT INTO top_sites (site, visits) VALUES (?, 1) "
+        "ON CONFLICT (site) DO UPDATE SET visits = top_sites.visits + 1",
+        (host,),
+    )
+
+
+def _db_track_bandwidth(conn, incoming: int, outgoing: int):
+    conn.execute(
+        "INSERT INTO bandwidth VALUES (?, ?, ?)",
+        (incoming, outgoing, incoming + outgoing),
+    )
+
+
+async def run_db(app, func, *args):
+    loop = asyncio.get_running_loop()
+    async with app["db_lock"]:
+        return await loop.run_in_executor(None, partial(func, app["db_conn"], *args))
+
+
 def proxy_auth_required():
     return web.Response(
         status=407,
         headers={"Proxy-Authenticate": 'Basic realm="Proxy"'},
-        text=json.dumps({"error": "Proxy authentication required"}),
+        text=dumps({"error": "Proxy authentication required"}),
         content_type="application/json",
     )
 
 
-async def authenticate(conn, request):
+async def authenticate(app, request):
     proxy_auth = request.headers.get("Proxy-Authorization")
     if not proxy_auth or not proxy_auth.startswith("Basic "):
         return False, proxy_auth_required()
 
     try:
-        credentials = base64.b64decode(proxy_auth[6:]).decode()
+        credentials = b64decode(proxy_auth[6:]).decode()
         username, password = credentials.split(":", 1)
     except Exception:
         return False, proxy_auth_required()
 
-    result = conn.execute(
-        "SELECT secret FROM users WHERE username = ?", (username,)
-    ).fetchone()
-    if result is None or result[0] != password:
+    if not await run_db(app, _db_authenticate, username, password):
         return False, proxy_auth_required()
 
     return True, None
 
 
 async def handle_metrics(request):
-    conn = request.app["db_conn"]
-    return web.json_response(get_metrics(conn))
+    return web.json_response(await run_db(request.app, _db_get_metrics))
+
+
+class TunnelProtocol(asyncio.Protocol):
+    def __init__(self):
+        self.reader = asyncio.StreamReader()
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def data_received(self, data):
+        self.reader.feed_data(data)
+
+    def connection_lost(self, exc):
+        self.reader.feed_eof()
 
 
 async def handle_connect(request):
     app = request.app
-    conn = app["db_conn"]
-    db_lock = app["db_lock"]
 
-    success, error = await authenticate(conn, request)
+    success, error = await authenticate(app, request)
     if not success:
         return error
 
@@ -112,19 +179,14 @@ async def handle_connect(request):
         host = host_port
         port = 443
 
-    async with db_lock:
-        conn.execute(
-            "INSERT INTO top_sites (site, visits) VALUES (?, 1) "
-            "ON CONFLICT (site) DO UPDATE SET visits = top_sites.visits + 1",
-            (host,),
-        )
+    await run_db(app, _db_track_site, host)
 
     try:
         remote_reader, remote_writer = await asyncio.open_connection(host, port)
     except Exception as e:
         return web.Response(
             status=502,
-            text=json.dumps({"error": f"Cannot connect to {host}:{port}: {e}"}),
+            text=dumps({"error": f"Cannot connect to {host}:{port}: {e}"}),
             content_type="application/json",
         )
 
@@ -135,21 +197,9 @@ async def handle_connect(request):
 
     transport.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
-    sock = transport.get_extra_info("socket")
-    if sock is None:
-        remote_writer.close()
-        transport.close()
-        return web.Response(status=502, text="Cannot access socket")
-
-    import socket as _socket
-    raw_fd = sock.fileno()
-    client_sock = _socket.fromfd(raw_fd, sock.family, sock.type, sock.proto)
-    client_sock.setblocking(False)
-
-    transport.pause_reading()
-
-    loop = asyncio.get_event_loop()
-    client_reader, client_writer = await asyncio.open_connection(sock=client_sock)
+    tunnel = TunnelProtocol()
+    transport.set_protocol(tunnel)
+    tunnel.transport = transport
 
     bytes_up = 0
     bytes_down = 0
@@ -158,7 +208,7 @@ async def handle_connect(request):
         nonlocal bytes_up
         try:
             while True:
-                data = await client_reader.read(65536)
+                data = await tunnel.reader.read(65536)
                 if not data:
                     break
                 bytes_up += len(data)
@@ -180,13 +230,12 @@ async def handle_connect(request):
                 if not data:
                     break
                 bytes_down += len(data)
-                client_writer.write(data)
-                await client_writer.drain()
+                transport.write(data)
         except (ConnectionError, asyncio.CancelledError):
             pass
         finally:
             try:
-                client_writer.close()
+                transport.close()
             except Exception:
                 pass
 
@@ -198,31 +247,27 @@ async def handle_connect(request):
         p.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
 
-    async with db_lock:
-        conn.execute(
-            "INSERT INTO bandwidth VALUES (?, ?, ?)",
-            (bytes_up, bytes_down, bytes_up + bytes_down),
-        )
+    await run_db(app, _db_track_bandwidth, bytes_up, bytes_down)
 
-    return web.Response()
+    raise web.HTTPOk()
 
 
-HOP_BY_HOP = frozenset({
-    "proxy-authorization",
-    "proxy-connection",
-    "connection",
-    "keep-alive",
-    "transfer-encoding",
-    "te",
-    "trailer",
-    "upgrade",
-})
+HOP_BY_HOP = frozenset(
+    {
+        "proxy-authorization",
+        "proxy-connection",
+        "connection",
+        "keep-alive",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "upgrade",
+    }
+)
 
 
 async def handle_http(request):
     app = request.app
-    conn = app["db_conn"]
-    db_lock = app["db_lock"]
 
     raw_target = request.raw_path
     is_proxy = raw_target.startswith("http://") or raw_target.startswith("https://")
@@ -234,23 +279,16 @@ async def handle_http(request):
 
     target = raw_target
 
-    success, error = await authenticate(conn, request)
+    success, error = await authenticate(app, request)
     if not success:
         return error
 
     parsed = urlparse(target)
     site_host = parsed.hostname or parsed.netloc.split(":")[0]
 
-    async with db_lock:
-        conn.execute(
-            "INSERT INTO top_sites (site, visits) VALUES (?, 1) "
-            "ON CONFLICT (site) DO UPDATE SET visits = top_sites.visits + 1",
-            (site_host,),
-        )
+    await run_db(app, _db_track_site, site_host)
 
-    headers = {
-        k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP
-    }
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
 
     try:
         sess = app["session"]
@@ -259,18 +297,14 @@ async def handle_http(request):
             target,
             headers=headers,
             data=await request.read(),
-            timeout=aiohttp.ClientTimeout(total=30),
+            timeout=ClientTimeout(total=30),
             allow_redirects=False,
         ) as resp:
             content = await resp.read()
             incoming = len(await request.read()) if request.can_read_body else 0
             outgoing = len(content)
 
-            async with db_lock:
-                conn.execute(
-                    "INSERT INTO bandwidth VALUES (?, ?, ?)",
-                    (incoming, outgoing, incoming + outgoing),
-                )
+            await run_db(app, _db_track_bandwidth, incoming, outgoing)
 
             resp_headers = {
                 k: v
@@ -282,7 +316,7 @@ async def handle_http(request):
     except Exception as e:
         return web.Response(
             status=502,
-            text=json.dumps({"error": str(e)}),
+            text=dumps({"error": str(e)}),
             content_type="application/json",
         )
 
@@ -295,7 +329,7 @@ async def connect_middleware(request, handler):
 
 
 async def on_startup(app):
-    conn = connect("metrics.db")
+    conn = connect("steel.db")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS bandwidth "
         "(incoming INTEGER, outgoing INTEGER, total_bytes INTEGER)"
@@ -306,22 +340,30 @@ async def on_startup(app):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, secret TEXT)"
     )
-    conn.execute(
-        "INSERT INTO users (username, secret) VALUES ('testuser', 'testpass') "
-        "ON CONFLICT (username) DO NOTHING"
-    )
+    hashed = hash_password("testpass")
+    existing = conn.execute(
+        "SELECT secret FROM users WHERE username = 'testuser'"
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            "INSERT INTO users (username, secret) VALUES ('testuser', ?)", (hashed,)
+        )
+    elif not existing[0].count(":"):
+        conn.execute(
+            "UPDATE users SET secret = ? WHERE username = 'testuser'", (hashed,)
+        )
     app["db_conn"] = conn
     app["db_lock"] = asyncio.Lock()
-    app["session"] = aiohttp.ClientSession()
+    app["session"] = ClientSession()
 
 
 async def on_shutdown(app):
     if "session" in app:
         await app["session"].close()
     if "db_conn" in app:
-        metrics = get_metrics(app["db_conn"])
+        metrics = _db_get_metrics(app["db_conn"])
         print("\n=== Proxy Server Shutdown Summary ===")
-        print(json.dumps(metrics, indent=2))
+        print(dumps(metrics, indent=2))
         app["db_conn"].close()
 
 
