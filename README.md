@@ -2,6 +2,9 @@
 
 Authenticated HTTP/HTTPS proxy with bandwidth and site analytics, built with `aiohttp` + `DuckDB`.
 
+- **Repo**: https://github.com/Diogenesoftoronto/steelchallenge
+- **Gist**: https://gist.github.com/Diogenesoftoronto/57cc110671014af38a6160f20d8473de
+
 ## Features
 
 - HTTP and HTTPS (CONNECT tunnel) proxy support
