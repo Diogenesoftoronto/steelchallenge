@@ -1,8 +1,6 @@
 """
 Proxy Server - Steel Challenge Solution
 
-The reason I choose to use duckdb rather than say just a file was because it is already pretty lightweight, can be easily extended and integrated.
-I could have used sqlite but duckdb has more creature comforts and is efficient enough. That does come with some tradeoffs, such as the need to install the duckdb library. whereas sqlite ialready included when users install python.
 An authenticated HTTP/HTTPS proxy server with bandwidth and site analytics.
 
 Usage:
@@ -18,17 +16,28 @@ Examples:
 Default user: testuser / testpass
 """
 
-import asyncio
 import hashlib
 import os
+import sqlite3
 import sys
+from asyncio import (
+    FIRST_COMPLETED,
+    CancelledError,
+    Lock,
+    Protocol,
+    StreamReader,
+    create_task,
+    gather,
+    get_running_loop,
+    open_connection,
+    wait,
+)
 from base64 import b64decode
 from functools import partial
 from json import dumps
 from urllib.parse import urlparse
 
 from aiohttp import ClientSession, ClientTimeout, web
-from duckdb import connect
 
 SCRYPT_N = 16384
 SCRYPT_R = 8
@@ -89,6 +98,7 @@ def _db_authenticate(conn, username: str, password: str) -> bool:
 
 
 def _db_track_site(conn, host: str):
+    # this 'on conflict' will run every single time a site is visited except the first time, i think this is a slow way to track sites, it is like way faster to just insert and then count.
     conn.execute(
         "INSERT INTO top_sites (site, visits) VALUES (?, 1) "
         "ON CONFLICT (site) DO UPDATE SET visits = top_sites.visits + 1",
@@ -104,7 +114,7 @@ def _db_track_bandwidth(conn, incoming: int, outgoing: int):
 
 
 async def run_db(app, func, *args):
-    loop = asyncio.get_running_loop()
+    loop = get_running_loop()
     async with app["db_lock"]:
         return await loop.run_in_executor(None, partial(func, app["db_conn"], *args))
 
@@ -139,9 +149,9 @@ async def handle_metrics(request):
     return web.json_response(await run_db(request.app, _db_get_metrics))
 
 
-class TunnelProtocol(asyncio.Protocol):
+class TunnelProtocol(Protocol):
     def __init__(self):
-        self.reader = asyncio.StreamReader()
+        self.reader = StreamReader()
         self.transport = None
 
     def connection_made(self, transport):
@@ -182,7 +192,7 @@ async def handle_connect(request):
     await run_db(app, _db_track_site, host)
 
     try:
-        remote_reader, remote_writer = await asyncio.open_connection(host, port)
+        remote_reader, remote_writer = await open_connection(host, port)
     except Exception as e:
         return web.Response(
             status=502,
@@ -214,7 +224,7 @@ async def handle_connect(request):
                 bytes_up += len(data)
                 remote_writer.write(data)
                 await remote_writer.drain()
-        except (ConnectionError, asyncio.CancelledError):
+        except (ConnectionError, CancelledError):
             pass
         finally:
             try:
@@ -231,7 +241,7 @@ async def handle_connect(request):
                     break
                 bytes_down += len(data)
                 transport.write(data)
-        except (ConnectionError, asyncio.CancelledError):
+        except (ConnectionError, CancelledError):
             pass
         finally:
             try:
@@ -239,13 +249,13 @@ async def handle_connect(request):
             except Exception:
                 pass
 
-    t1 = asyncio.create_task(pipe_up())
-    t2 = asyncio.create_task(pipe_down())
+    t1 = create_task(pipe_up())
+    t2 = create_task(pipe_down())
 
-    done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+    done, pending = await wait({t1, t2}, return_when=FIRST_COMPLETED)
     for p in pending:
         p.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    await gather(*pending, return_exceptions=True)
 
     await run_db(app, _db_track_bandwidth, bytes_up, bytes_down)
 
@@ -329,7 +339,7 @@ async def connect_middleware(request, handler):
 
 
 async def on_startup(app):
-    conn = connect("steel.db")
+    conn = sqlite3.connect("steel.db", check_same_thread=False)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS bandwidth "
         "(incoming INTEGER, outgoing INTEGER, total_bytes INTEGER)"
@@ -353,7 +363,7 @@ async def on_startup(app):
             "UPDATE users SET secret = ? WHERE username = 'testuser'", (hashed,)
         )
     app["db_conn"] = conn
-    app["db_lock"] = asyncio.Lock()
+    app["db_lock"] = Lock()
     app["session"] = ClientSession()
 
 

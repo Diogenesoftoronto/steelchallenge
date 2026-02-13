@@ -1,16 +1,14 @@
-# Proxy Server Challenge
+# Proxy Server Challenge (aiohttp + SQLite + uv)
 
-Authenticated HTTP/HTTPS proxy with bandwidth and site analytics, built with `aiohttp` + `DuckDB`.
-
-- **Repo**: https://github.com/Diogenesoftoronto/steelchallenge
-- **Gist**: https://gist.github.com/Diogenesoftoronto/57cc110671014af38a6160f20d8473de
+Authenticated HTTP/HTTPS forward proxy with bandwidth and site analytics.
 
 ## Features
 
-- HTTP and HTTPS (CONNECT tunnel) proxy support
-- Proxy authentication via `Proxy-Authorization: Basic` header
-- Bandwidth tracking for both HTTP and HTTPS traffic
-- Real-time `GET /metrics` endpoint
+- HTTP proxying for absolute-form targets (for example, `http://example.com`)
+- HTTPS proxying via `CONNECT` tunneling
+- Proxy auth via `Proxy-Authorization: Basic ...`
+- Metrics endpoint at `GET /metrics` (no auth required)
+- SQLite-backed analytics (`steel.db`)
 - Shutdown summary printed on `Ctrl+C`
 
 ## Run
@@ -20,24 +18,40 @@ uv sync
 uv run python app/main.py 8002
 ```
 
-## Usage
+Default proxy credentials are:
+
+- username: `testuser`
+- password: `testpass`
+
+## Proxy Usage
+
+HTTP through proxy:
 
 ```bash
-# HTTP proxy
-curl -x http://localhost:8002 --proxy-user username:password -L http://example.com
+curl -x http://localhost:8002 --proxy-user testuser:testpass http://example.com
+```
 
-# HTTPS proxy
-curl -x http://localhost:8002 --proxy-user username:password -L https://example.com
+HTTPS through proxy:
 
-# Metrics (no auth required)
+```bash
+curl -x http://localhost:8002 --proxy-user testuser:testpass https://example.com
+```
+
+If credentials are missing or invalid, the proxy returns `407 Proxy Authentication Required`.
+
+## Metrics
+
+`GET /metrics` returns aggregated bandwidth and visited sites.
+
+```bash
 curl http://localhost:8002/metrics
 ```
 
-## Metrics Response
+Example response:
 
 ```json
 {
-  "bandwidth_usage": "125.0MB",
+  "bandwidth_usage": "125MB",
   "top_sites": [
     {"url": "example.com", "visits": 10},
     {"url": "google.com", "visits": 5}
@@ -45,22 +59,15 @@ curl http://localhost:8002/metrics
 }
 ```
 
-## Tests
+Notes:
 
-Start the server, then run:
+- `GET /metrics` is available without proxy auth.
+- Other direct local paths (for example, `/nonexistent`) return `404`.
+
+## Test Script
+
+With the proxy running, execute:
 
 ```bash
 bash tests/test_proxy.sh
 ```
-
-## Adding Users
-
-```bash
-uv run python -c "
-from duckdb import connect
-conn = connect('metrics.db')
-conn.execute(\"INSERT INTO users VALUES ('alice', 'secret123')\")
-"
-```
-
-Default user: `testuser` / `testpass`
