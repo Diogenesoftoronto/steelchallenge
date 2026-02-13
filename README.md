@@ -24,10 +24,10 @@ uv run python app/main.py 8002
 
 ```bash
 # HTTP proxy
-curl -x http://localhost:8002 --proxy-user testuser:testpass http://example.com
+curl -x http://localhost:8002 --proxy-user username:password -L http://example.com
 
 # HTTPS proxy
-curl -x http://localhost:8002 --proxy-user testuser:testpass https://example.com
+curl -x http://localhost:8002 --proxy-user username:password -L https://example.com
 
 # Metrics (no auth required)
 curl http://localhost:8002/metrics
@@ -37,7 +37,7 @@ curl http://localhost:8002/metrics
 
 ```json
 {
-  "bandwidth_usage": "125.00MB",
+  "bandwidth_usage": "125.0MB",
   "top_sites": [
     {"url": "example.com", "visits": 10},
     {"url": "google.com", "visits": 5}
